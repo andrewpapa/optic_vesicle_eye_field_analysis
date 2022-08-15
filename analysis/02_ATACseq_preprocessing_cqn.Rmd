@@ -1,0 +1,163 @@
+---
+title: "Preprocessing ATAC-seq data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load required libraries
+```{r echo=FALSE, message=FALSE}
+library(readxl)
+library(Matrix)
+library(irlba)
+library(ggplot2)
+library(matrixStats)
+library(IRanges)
+```
+
+Set data directory and read in data.
+```{r}
+data_dir <- "../data"
+data_file <- "ATACseq_ReadCount_per_peak.xlsx"
+filename <- paste(data_dir,data_file,sep="/")
+
+atac_data <- read_excel(filename)
+```
+
+First remove blacklisted regions from `mm10` reference genome. We import the dataset
+of these regions found [here](http://mitra.stanford.edu/kundaje/akundaje/release/blacklists/)
+```{r}
+blacklist_df <- as.data.frame(read.table(file = '../data/mm10.blacklist.bed', sep = '\t', header = FALSE))
+colnames(blacklist_df) <- c('chrom','chromStart','chromEnd')
+
+ranges_data <- split(IRanges(atac_data$chromStart, atac_data$chromEnd), atac_data$chrom)
+ranges_blacklist <- split(IRanges(blacklist_df$chromStart, blacklist_df$chromEnd), blacklist_df$chrom)
+
+# check which peaks overlap with blacklist ranges 
+ov <- countOverlaps(ranges_data, ranges_blacklist, type="any")
+
+# remove all regions with overlaps
+atac_data <- atac_data[!(as.data.frame(ov)$value > 0),]
+print(paste("Removed",sum(as.data.frame(ov)$value > 0),"features (blacklisted) from ATAC dataframe",sep=" "))
+```
+
+Also, remove any features that map onto chrM (these should have already been removed).
+```{r}
+atac_data <- atac_data[!atac_data$chrom == "chrM",]
+```  
+
+Read in GC-content file (pre-computed)
+```{r}
+gc_pct_file = "/home/andrew/biology/xdf/rotation3/mammalian_eftfs/notebooks/output/ATACseq-peaks-gc.csv"
+atac_peak_gc <- read.table(gc_pct_file,header=TRUE)
+atac_peak_gc <- atac_peak_gc$GC.pct * 0.01
+
+atac_peak_lengths <- atac_data$chromEnd - atac_data$chromStart
+
+length(atac_peak_gc)
+length(atac_peak_lengths)
+dim(atac_data)
+```
+
+Normalization using conditional quantile normalization (quantile normalization, followed by GC-content normalization).
+```{r}
+library("cqn")
+
+sizefactors <- c(99256742,112711022,105618024,114243118,108959868,140288820) # total mapped reads in bam files (determined using $ samtools flagstat file.bam command)
+
+sizefactors
+
+atac_cqn <- cqn(atac_data[,c(4,5,6,7,8,9)], lengths = atac_peak_lengths, 
+                       x=atac_peak_gc,  sizeFactors=sizefactors, verbose = TRUE, lengthMethod = "fixed")
+
+atac_norm <- atac_cqn$y + atac_cqn$offset
+```
+
+Generate genomic context annotations for ATACseq peaks using ChIPseeker.
+```{r}
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(org.Mm.eg.db)
+library(stringr)
+
+#peak_bed_file <- "../data/ATACseq-peak_locations.bed"
+peak_bed_file <- "/home/andrew/biology/xdf/rotation3/mammalian_eftfs/optic_vesicle_eye_field_analysis/data/ATACseq-peak_locations.bed"
+atac_data[2] <- lapply(atac_data[2],as.integer)
+atac_data[3] <- lapply(atac_data[3],as.integer)
+write.table(as.data.frame(atac_data[1:3]),peak_bed_file,quote=FALSE,sep='\t',row.names = F,col.names = F)
+
+txdb <- TxDb.Mmusculus.UCSC.mm10.knownGene
+peakAnno <- annotatePeak(peak_bed_file, tssRegion=c(-1000, 500), TxDb=txdb, annoDb="org.Mm.eg.db",overlap="TSS")
+
+anno_df <- as.data.frame(peakAnno)
+
+atac_peak_context <- anno_df$annotation
+for (context in c("Exon","Intron","Distal","Promoter","Downstream","3' UT", "5' UT")) {
+  bool_context <- startsWith(anno_df$annotation,context)
+  if (context %in% c("Exon","3' UT", "5' UT")) {
+    atac_peak_context[bool_context] <- "exon"
+  } else if (context == "Intron") {
+    atac_peak_context[bool_context] <- "intron"
+  }
+  else if (context == "Promoter") {
+    atac_peak_context[bool_context] <- "promoter"
+  }  else if (context %in% c("Distal","Downstream")) {
+    atac_peak_context[bool_context] <- "intergenic"
+  }
+}
+unique(atac_peak_context)
+atac_peak_context <- as.data.frame(atac_peak_context)
+colnames(atac_peak_context) <- c("context")
+atac_peak_context$nearest_gene_ensemble <- anno_df$ENSEMBL
+atac_peak_context$nearest_gene_id <- anno_df$SYMBOL
+```
+
+## Output all ATAC-seq features to file for downstream analysis
+
+For potential TAD modelling, we record the TAD-id for each gene. This uses TAD boundaries 
+derived by the Aerts Lab obtained from [here](https://github.com/aertslab/mucistarget/tree/master/data/tads), 
+using data from [Bonev et al, 2017](https://dx.doi.org/10.1016%2Fj.cell.2017.09.043).
+```{r}
+library(IRanges)
+library(stringr)
+library(GenomicRanges)
+tad_file <- '/home/andrew/biology/xdf/rotation3/mammalian_eftfs/notebooks/TADs-interTADs_mESC.Bonev_2017.bed'
+tmp_tads <- read.table(tad_file,header=FALSE)
+colnames(tmp_tads) <- c('chrom','chromStart','chromEnd','source')
+  
+genomic_locations <- atac_data[1:3]
+
+ranges_peaks <- with(genomic_locations,GRanges(chrom,IRanges(chromStart,chromEnd)))
+ranges_tads <- with(tmp_tads,GRanges(chrom,IRanges(chromStart,chromEnd),source=source))
+
+peak_tad_ov <- findOverlaps(ranges_peaks, ranges_tads, type="within", select = "all")
+peak_tad_ov <- as.matrix(peak_tad_ov)
+
+tad_id <- vector(length = dim(genomic_locations)[1])
+for (i in seq(1:dim(genomic_locations)[1])) {
+  if (i %in% peak_tad_ov[,1]) {
+    tad_id[i] <- peak_tad_ov[,2][peak_tad_ov[,1] == i]
+  }
+  else {
+    tad_id[i] <- -1
+  }
+}
+
+tad_df <- as.data.frame(tad_id)
+colnames(tad_df) <- c("tad-id-bonev")
+```
+
+Save preprocessed data (for all peaks minus those overlapping 
+with blacklisted regions) to a tsv file for further processing.
+```{r}
+# set up df to save
+tmp_df <- atac_norm
+tmp_df <- cbind(tmp_df, genomic_locations) # add genomic coordinate information
+tmp_df <- cbind(tmp_df, atac_peak_context) # add genomic context information
+tmp_df <- cbind(tmp_df, tad_df)            # add tad information
+
+filename <- "../data/ATACseq-CQN-preprocessed-norm-counts.tsv"
+write.table(tmp_df,filename,quote=FALSE,sep='\t',col.names = NA)
+```
